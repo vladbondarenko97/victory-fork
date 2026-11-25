@@ -11,7 +11,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::object::{HRESULT, S_FALSE, S_OK, This};
@@ -66,6 +66,29 @@ pub(crate) extern "system" fn set_interval(
         first,
     });
     S_OK
+}
+
+/// Set while fast boot ran the clock without sleeping.
+static UNTHROTTLED: AtomicBool = AtomicBool::new(false);
+
+/// Fast boot (testing only): while the title is not in the world our own
+/// pacing sleep is skipped. Ticks still advance one per wait, so tokens stay
+/// consecutive; the title's own clocks are untouched. Returns whether this
+/// wait runs unthrottled. When fast boot ends the clock restarts from now,
+/// so the ticks run ahead meanwhile are not slept off.
+fn unthrottled() -> bool {
+    if victory_core::fastboot::active() {
+        UNTHROTTLED.store(true, Ordering::Relaxed);
+        return true;
+    }
+    if UNTHROTTLED.swap(false, Ordering::Relaxed) {
+        let first = LAST.iter().map(|t| t.load(Ordering::Relaxed)).max().unwrap_or(0);
+        if let Some(c) = clock().as_mut() {
+            c.start = Instant::now();
+            c.first = first;
+        }
+    }
+    false
 }
 
 /// Device method: events are scheduled at every tick.
@@ -142,7 +165,11 @@ pub(crate) extern "system" fn wait(
         tick -= 1;
         wait = Duration::ZERO;
     }
-    let hr = if wait > limit {
+    let fast = unthrottled() && !limit.is_zero();
+    let hr = if fast {
+        last(kind).fetch_max(tick, Ordering::Relaxed);
+        S_OK
+    } else if wait > limit {
         std::thread::sleep(limit);
         TIMEOUT
     } else {

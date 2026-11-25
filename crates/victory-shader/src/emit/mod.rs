@@ -18,7 +18,13 @@
 //!   `SamplerDescriptorHeap[]`, at the index the console address gives, so
 //!   the host heaps keep the title's descriptor order. The root signature
 //!   needs `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` and
-//!   `SAMPLER_HEAP_DIRECTLY_INDEXED`.
+//!   `SAMPLER_HEAP_DIRECTLY_INDEXED`. A host view heap capped below the
+//!   title's slots may keep only an identity window of them in place
+//!   ([`set_view_heap_map`]): a view taken from the resource heap itself
+//!   (a root parameter of type `ResourceHeap`, not a table) at a title
+//!   index past the window is then read at the host slot the heap map (a
+//!   raw buffer view at a fixed view heap slot) gives, as its bitwise not
+//!   at dword `index - window` (0 there: the null slot past the limit).
 //! * **Immediate samplers** as static samplers `s<n>, space 0`, `n` the
 //!   position in [`HostShader::samplers`] (the console sampler words) and
 //!   [`HostShader::static_samplers`] (the same decoded into a D3D12 static
@@ -82,6 +88,7 @@
 
 mod bitcode;
 mod container;
+pub mod exposure;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
@@ -90,9 +97,11 @@ mod intersect_tests;
 pub mod host;
 mod lower;
 mod own_bits;
+mod per_program;
 mod rect;
 mod sampler;
 mod shader;
+pub mod stand_in;
 mod threading;
 #[cfg(windows)]
 pub mod validator;
@@ -103,6 +112,7 @@ mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
 mod wave;
+pub mod words;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -111,11 +121,12 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
+pub use per_program::{deep_skips_allowed, for_program, wave64_retried};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit,
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_ADDRESSES, SLOT_FAULTS, SLOT_MEMORY,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_STRIDES_DWORDS, SLOT_WORDS, USER_DATA_SPACE, USER_MEMORY_BASE,
+    USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, set_view_heap_map, view_heap_limit, view_heap_map,
 };
 
 /// The loop limit without an override: 2^20.
@@ -173,8 +184,12 @@ pub fn group_sync() -> u8 {
 /// is exact, so the switch is for telling a translator fault from a
 /// clean-up fault, and for measuring what the clean-up is worth.
 /// `VICTORY_SHADER_OPT`:
-/// - unset: every pass.
+/// - unset: none. Off by default in this tree: with the passes on, the
+///   first room's walls, roof and floor are missing from the picture on
+///   RTX 4080, RTX 3080 and RX 7800 XT (Xeltax/VIcky VICKY.md, same-save
+///   A/B), and no later fxceless commit fixes it. Set `on` to try them.
 /// - `0`: none (the module as the lowering made it).
+/// - `on` or `all`: every pass.
 /// - a number (decimal or `0x` hex): those passes; 1 dead code, 2 constants
 ///   and identities, 4 one instruction for one value, 8 what a branch taken
 ///   says about its condition, 16 one read for one place within a block,
@@ -188,16 +203,18 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
-/// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
-/// unreadable. Pure, for testing.
+/// `VICTORY_SHADER_OPT`'s value; no pass when it is unset or unreadable,
+/// every pass for `on`/`all`. Pure, for testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {
-    let parsed = value
-        .map(str::trim)
-        .and_then(|v| match v.strip_prefix("0x") {
-            Some(hex) => u32::from_str_radix(hex, 16).ok(),
-            None => v.parse().ok(),
-        });
-    parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
+    let Some(v) = value.map(str::trim) else { return 0 };
+    if v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("all") {
+        return bitcode::opt::ALL;
+    }
+    let parsed: Option<u32> = match v.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => v.parse().ok(),
+    };
+    parsed.map_or(0, |n| n & bitcode::opt::ALL)
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -271,11 +288,33 @@ pub struct UserData {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_code(container, None)
+}
+
+/// [`translate`] with `code` in place of the program's own when given.
+fn translate_code(container: &[u8], code: Option<Vec<u8>>) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
+    let mut native = main_program(&c)?;
+    if let Some(code) = code {
+        native.code = code;
+    }
+    let p = crate::spill::build(&native)?;
+    // Structurisation first: tracing per-lane descriptors needs it (its
+    // failure is reported after the earlier stages').
+    let st = structure::structure(&p);
+    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let io = io::raise(&p, &native)?;
+    let st = st?;
+    emit(&c, &native, &p, &st, &io, &res)
+}
+
+/// The program of a container that [`translate`] translates: its vertex,
+/// pixel, compute or mesh program.
+fn main_program(c: &Container) -> Result<NativeProgram, ShaderError> {
     let dxil = c
         .part(FourCC::DXIL)
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -286,15 +325,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
         .ok_or(ShaderError::Unsupported {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
-        })?;
-    let p = crate::spill::build(&native)?;
-    // Structurisation first: tracing per-lane descriptors needs it (its
-    // failure is reported after the earlier stages').
-    let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
-    let io = io::raise(&p, &native)?;
-    let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+        })
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -324,11 +355,14 @@ pub fn emit(
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+        // (each line names the program by its hash, when the caller gave it: [`for_program`])
+        let program = per_program::current();
+        let hash = program.as_deref().unwrap_or("?");
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
                 match r {
-                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
-                    Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
+                    Ok((_, wave)) => eprintln!("WAVE64-RETRY #{hash} {what}: wave {wave:?}"),
+                    Err(e) => eprintln!("WAVE64-RETRY #{hash} {what}: {e}"),
                 }
             }
         };
@@ -346,7 +380,7 @@ pub fn emit(
             Ok(()) => true,
             Err((offset, what)) => {
                 if why {
-                    eprintln!("WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}");
+                    eprintln!("WAVE64-RETRY #{hash} local waves: not the allocation idiom at {offset:#x}: {what}");
                 }
                 false
             }
@@ -388,8 +422,13 @@ pub fn emit(
                 // Every skip left out that the code after it cannot see
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
                 // lane runs, where the two host waves can exchange.
-                // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
-                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+                // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off;
+                // `VICTORY_WAVE_DEEP_SKIPS_NOT` and `_ONLY` the first for some programs:
+                // [`deep_skips_allowed`].)
+                let deep_on = deep_skips_allowed(program.as_deref());
+                if why && !deep_on {
+                    eprintln!("WAVE64-RETRY #{hash} without skips, scalars followed: off for this program");
+                }
                 let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
@@ -761,9 +800,11 @@ mod tests {
     use super::parse_loop_limit;
 
     #[test]
-    fn the_clean_up_switch_parses_or_runs_every_pass() {
+    fn the_clean_up_switch_parses_and_is_off_by_default() {
         let all = super::bitcode::opt::ALL;
-        assert_eq!(parse_shader_opt(None), all);
+        assert_eq!(parse_shader_opt(None), 0);
+        assert_eq!(parse_shader_opt(Some("junk")), 0);
+        assert_eq!(parse_shader_opt(Some("ALL")), all);
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);

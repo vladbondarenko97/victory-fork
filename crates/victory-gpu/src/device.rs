@@ -273,12 +273,14 @@ extern "system" fn check_feature_support(
     const FEATURE_LEVELS: u32 = 2;
     const FORMAT_SUPPORT: u32 = 3;
     const MULTISAMPLE: u32 = 4;
+    const OPTIONS5: u32 = 27;
     let expected = match feature {
         OPTIONS_QUERY => size_of_val(&OPTIONS),
         ARCHITECTURE => 16,
         FEATURE_LEVELS => size_of::<FeatureLevels>(),
         FORMAT_SUPPORT => 12,
         MULTISAMPLE => 16,
+        OPTIONS5 if raytracing_off() => 12,
         _ => {
             tracing::warn!(feature, size, "device feature query not implemented");
             return E_NOTIMPL;
@@ -288,6 +290,13 @@ extern "system" fn check_feature_support(
         return E_INVALIDARG;
     }
     match feature {
+        OPTIONS5 => {
+            // SRV-only tiled tier, render passes tier, ray-tracing tier: all
+            // none (`VICTORY_RAYTRACING=off`, ported from ef80b32).
+            // SAFETY: checked size and non-null.
+            unsafe { data.cast::<[u32; 3]>().write_unaligned([0, 0, 0]) };
+            S_OK
+        }
         OPTIONS_QUERY => {
             // SAFETY: checked size and non-null.
             unsafe { data.cast::<[u32; 16]>().write_unaligned(OPTIONS) };
@@ -322,6 +331,21 @@ extern "system" fn check_feature_support(
         }
         _ => feature_levels(data),
     }
+}
+
+/// `VICTORY_RAYTRACING=off`: the title's OPTIONS5 query is answered "no ray
+/// tracing" (tier 0) instead of E_NOTIMPL, so it may take a path without it.
+/// Unset or anything else: E_NOTIMPL as before.
+fn raytracing_off() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        let off = std::env::var("VICTORY_RAYTRACING")
+            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no"));
+        if off {
+            tracing::warn!("VICTORY_RAYTRACING=off: OPTIONS5 reports no ray tracing");
+        }
+        off
+    })
 }
 
 fn feature_levels(data: *mut c_void) -> HRESULT {

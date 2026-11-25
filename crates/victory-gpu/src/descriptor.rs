@@ -12,6 +12,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+mod slot_map;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(

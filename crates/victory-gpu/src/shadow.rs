@@ -139,19 +139,71 @@ pub(crate) fn cards() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
 }
 
+/// Default `(min_mb, max_mb)` for [`card_limits`] chosen from the adapter's
+/// local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), in bytes.
+///
+/// - Unknown (`None`, e.g. WARP) or `<= 12 GiB` (8–12 GB cards, whose WDDM
+///   budget is below 12 GiB): `(16, 512)` MiB, matching the 12 GB baseline.
+/// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
+///   ~13.5–15.2 GiB): `(4, 2048)` MiB.
+/// - `>= 20 GiB` (24–32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
+///   capping at 25% of local budget (at most 8 GiB) so "before" twins (up to 2x)
+///   still leave headroom for textures and render targets.
+fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
+    let Some(budget_bytes) = local_vram_budget else {
+        return (16, 512);
+    };
+    let budget_mb = budget_bytes >> 20;
+    const TWELVE_GIB_MB: u64 = 12 * 1024;
+    const TWENTY_GIB_MB: u64 = 20 * 1024;
+    if budget_mb <= TWELVE_GIB_MB {
+        (16, 512)
+    } else if budget_mb < TWENTY_GIB_MB {
+        (4, 2048)
+    } else {
+        (1, (budget_mb / 4).min(8192))
+    }
+}
+
+/// Resolve `(min_bytes, max_bytes)` from the adapter's local VRAM budget and
+/// optional explicit MiB overrides from `VICTORY_CARD_BUFFERS_MIN_MB` /
+/// `VICTORY_CARD_BUFFERS_MB`.
+fn resolve_card_limits(
+    local_vram_budget: Option<u64>,
+    min_mb_override: Option<u64>,
+    max_mb_override: Option<u64>,
+) -> (u64, u64) {
+    const MIB: u64 = 1 << 20;
+    let (default_min_mb, default_max_mb) = default_card_limits_mb(local_vram_budget);
+    let min_bytes = min_mb_override.unwrap_or(default_min_mb).saturating_mul(MIB).max(MIB);
+    let max_bytes = max_mb_override.unwrap_or(default_max_mb).saturating_mul(MIB);
+    (min_bytes, max_bytes)
+}
+
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
-/// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
-/// 1,650 MB of the card's budget free.
+/// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB`.
+/// Defaults scale with the adapter's local VRAM budget (16 MiB / 512 MiB on
+/// `<= 12 GiB` budgets, 4 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
+/// on `>= 20 GiB` budgets), and explicit env vars always override.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
-        };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
+        let env_mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let vram_budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+        let (min_bytes, max_bytes) = resolve_card_limits(
+            vram_budget,
+            env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
+            env_mb("VICTORY_CARD_BUFFERS_MB"),
+        );
+        tracing::info!(
+            vram_budget_mb = vram_budget.map(|b| b >> 20),
+            card_buffers_min_mb = min_bytes >> 20,
+            card_buffers_max_mb = max_bytes >> 20,
+            "card buffer limits"
+        );
+        (min_bytes, max_bytes)
     })
 }
 
@@ -454,7 +506,7 @@ mod card_tests {
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
 /// beside the submitting thread and outside the submission lock
-/// (`VICTORY_RELAY=1` or `2`; off by default; not with kept snapshots,
+/// ([`relay_level`] above 0; off by default; not with kept snapshots,
 /// [`keeps`]). `crate::host::relay` says what it does; here it changes
 /// what a copy keeps:
 ///
@@ -470,7 +522,27 @@ mod card_tests {
 ///   had not received from bytes the card wrote.
 pub(crate) fn relay() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").is_ok_and(|v| v == "1" || v == "2") && !keeps())
+    *ON.get_or_init(|| relay_level() > 0 && !keeps())
+}
+
+/// The relay's stage from `VICTORY_RELAY`: `1` is its first stage, `2` its
+/// second (`crate::host::relay`), anything else (or unset) off. Stage 2 took
+/// the frame from about 230 to about 132 ms on an RTX 4090 (victory-fork
+/// #187), but in the same-save A/B of victory-fork #168 every relay or
+/// late-wait run lost the first room's walls and no default run did, so it
+/// stays off by default in this tree until that is understood.
+pub(crate) fn relay_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| relay_level_of(std::env::var("VICTORY_RELAY").ok().as_deref()))
+}
+
+/// [`relay_level`] for a value of `VICTORY_RELAY` (`None`: unset).
+fn relay_level_of(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    }
 }
 
 /// The submission being prepared (its number among those started): what
@@ -591,7 +663,17 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{Flights, changed_runs, merge_piece, outside};
+    use super::{Flights, changed_runs, merge_piece, outside, relay_level_of};
+
+    #[test]
+    fn the_relay_is_off_unless_told_a_stage() {
+        assert_eq!(relay_level_of(None), 0);
+        assert_eq!(relay_level_of(Some("2")), 2);
+        assert_eq!(relay_level_of(Some(" 2 ")), 2);
+        assert_eq!(relay_level_of(Some("1")), 1);
+        assert_eq!(relay_level_of(Some("0")), 0);
+        assert_eq!(relay_level_of(Some("")), 0);
+    }
 
     /// A range two flights declared is free only when both are done, in
     /// either order; a submission that declares it many times counts once.
@@ -830,10 +912,23 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
+/// Snapshot buffer pool byte cap scaled from total system RAM.
+fn snapshot_pool_cap(total_ram_bytes: Option<u64>) -> usize {
+    const FALLBACK: u64 = 512 << 20;
+    const MIN: u64 = 128 << 20;
+    const MAX: u64 = 1024 << 20;
+    let bytes = match total_ram_bytes {
+        Some(ram) => (ram / 32).clamp(MIN, MAX),
+        None => FALLBACK,
+    };
+    bytes as usize
+}
+
 /// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
-/// of those the largest one and the next ones up to `KEPT` bytes in all.
+/// of those the largest one and the next ones up to [`snapshot_pool_cap`]
+/// bytes in all.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let kept = snapshot_pool_cap(crate::total_system_ram_bytes());
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
@@ -842,7 +937,7 @@ fn give_back(v: Vec<u8>) {
     pool.retain(|v| {
         seen += 1;
         total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
+        seen == 1 || total <= kept
     });
 }
 
@@ -1565,17 +1660,20 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
-    const IDLE_MS: u64 = 10_000;
     const IDLE_FRAMES: u64 = 4;
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if map.is_empty() {
+            return;
+        }
+        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), IDLE_MS, IDLE_FRAMES)
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1
             })
             .map(|(key, _)| *key)
@@ -3049,7 +3147,40 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 
 #[cfg(test)]
 mod window_tests {
-    use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};
+    use super::{
+        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
+        tail_of, window_of,
+    };
+
+    #[test]
+    fn card_limits_scale_with_local_vram_budget() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+
+        // Unknown (WARP / query failure) and <= 12 GiB keep the 12 GB baseline.
+        assert_eq!(default_card_limits_mb(None), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
+
+        // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
+        assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));
+        assert_eq!(default_card_limits_mb(Some(14 * GIB)), (4, 2048));
+        assert_eq!(default_card_limits_mb(Some(15 * GIB)), (4, 2048));
+        assert_eq!(default_card_limits_mb(Some(16 * GIB)), (4, 2048));
+
+        // 24–32+ GB tier (>= 20 GiB): 1 MiB min, 25% of budget capped at 8192 MiB.
+        assert_eq!(default_card_limits_mb(Some(20 * GIB)), (1, 5120));
+        assert_eq!(default_card_limits_mb(Some(24 * GIB)), (1, 6144));
+        assert_eq!(default_card_limits_mb(Some(32 * GIB)), (1, 8192));
+        assert_eq!(default_card_limits_mb(Some(48 * GIB)), (1, 8192));
+
+        // Explicit env overrides always win, clamp min to >= 1 MiB, and saturate on overflow.
+        assert_eq!(resolve_card_limits(Some(32 * GIB), Some(8), Some(4096)), (8 * MIB, 4096 * MIB));
+        assert_eq!(resolve_card_limits(Some(12 * GIB), Some(0), Some(1024)), (MIB, 1024 * MIB));
+        assert_eq!(resolve_card_limits(None, Some(u64::MAX), Some(u64::MAX)), (u64::MAX, u64::MAX));
+        assert_eq!(resolve_card_limits(None, None, None), (16 * MIB, 512 * MIB));
+    }
 
     /// An ask that may take any window takes the longest that holds all of
     /// it, and none that holds only a part.
@@ -3150,6 +3281,18 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+
+    #[test]
+    fn snapshot_pool_cap_scales_with_ram() {
+        const GIB: u64 = 1 << 30;
+        const MIB: usize = 1 << 20;
+        assert_eq!(super::snapshot_pool_cap(None), 512 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(2 * GIB)), 128 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(8 * GIB)), 256 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(16 * GIB)), 512 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(32 * GIB)), 1024 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(64 * GIB)), 1024 * MIB);
     }
 }
 

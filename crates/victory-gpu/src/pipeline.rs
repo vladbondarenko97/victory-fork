@@ -152,19 +152,25 @@ impl Shader {
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 match &done {
-                    Ok(t) => tracing::info!(
+                    Ok(t) => tracing::debug!(
                         stage = self.stage,
                         hash = %self.hash,
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        static FAILED: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        if victory_core::logging::sample(&FAILED) {
+                            tracing::warn!(
+                                stage = self.stage,
+                                hash = %self.hash,
+                                error = %e,
+                                "shader does not translate; its pipelines' draws are dropped"
+                            );
+                        }
+                    }
                 }
                 done.ok()
             })
@@ -379,7 +385,7 @@ pub(crate) fn bound(this: This) {
     }
     let frame = crate::frame::current();
     for shader in &p.shaders {
-        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        tracing::debug!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
     }
 }
 

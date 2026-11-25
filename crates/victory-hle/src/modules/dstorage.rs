@@ -141,7 +141,10 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
-    tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
+    static OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if victory_core::logging::sample(&OPENED) {
+        tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
+    }
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });

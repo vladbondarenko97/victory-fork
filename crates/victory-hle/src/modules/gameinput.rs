@@ -450,13 +450,16 @@ impl State {
         &mut self,
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
-        keys: Vec<KeyState>,
+        mut keys: Vec<KeyState>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
+        }
+        if !any_pad {
+            auto_input_inject(&mut keys);
         }
         let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
@@ -507,6 +510,112 @@ impl State {
                     .map(|r| r.event(index, now, current, previous)),
             );
         }
+    }
+}
+
+/// VICTORY_PRESS_FILE=<path>: buttons written to that file ("A", "DOWN DOWN A") are held one
+/// after another for 150 ms each, then the file is emptied.
+fn live_press(keys: &mut Vec<KeyState>) {
+    use std::sync::{Mutex, OnceLock};
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    static Q: Mutex<(Option<Instant>, Vec<u8>, Option<Instant>)> = Mutex::new((None, Vec::new(), None));
+    let Some(path) = PATH.get_or_init(|| std::env::var("VICTORY_PRESS_FILE").ok()) else { return };
+    let mut q = Q.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if q.1.is_empty() && q.0.is_none_or(|t| now - t >= Duration::from_millis(50)) {
+        q.0 = Some(now);
+        if let Ok(s) = std::fs::read_to_string(path) {
+            if !s.trim().is_empty() {
+                let _ = std::fs::write(path, "");
+                q.1 = s
+                    .split_whitespace()
+                    .rev()
+                    .filter_map(|b| match b.to_ascii_uppercase().as_str() {
+                        "A" => Some(0x0D),
+                        "B" => Some(0x08),
+                        "UP" => Some(0x26),
+                        "DOWN" => Some(0x28),
+                        "LEFT" => Some(0x25),
+                        "RIGHT" => Some(0x27),
+                        "MENU" | "START" => Some(0x1B),
+                        "VIEW" => Some(0x09),
+                        "LS_UP" => Some(b'W'),
+                        "LS_DOWN" => Some(b'S'),
+                        "LS_LEFT" => Some(b'A'),
+                        "LS_RIGHT" => Some(b'D'),
+                        "RS_UP" => Some(b'I'),
+                        "RS_DOWN" => Some(b'K'),
+                        "RS_LEFT" => Some(b'J'),
+                        "RS_RIGHT" => Some(b'L'),
+                        "X" => Some(b'X'),
+                        "Y" => Some(b'Y'),
+                        _ => None,
+                    })
+                    .collect();
+                q.2 = Some(now);
+            }
+        }
+    }
+    let Some(&vk) = q.1.last() else { return };
+    let held = q.2.map_or(Duration::ZERO, |t| now - t);
+    // Stick tokens (LS_*, RS_*) are held 1.5 s, buttons 150 ms.
+    let hold = if b"WASDIJKL".contains(&vk) { 1500 } else { 150 };
+    if held < Duration::from_millis(hold) {
+        keys.push(KeyState { scan_code: 0, code_point: 0, virtual_key: vk, dead_key: false });
+    } else if held >= Duration::from_millis(hold + 150) {
+        q.1.pop();
+        q.2 = Some(now);
+    }
+}
+
+/// VICTORY_FAST_BOOT (testing only): A on every other presented frame, and
+/// START on one frame in eight (skips cutscenes), from the first frame until
+/// the title is in the world; then nothing, for good.
+fn fast_boot_keys(keys: &mut Vec<KeyState>) {
+    if !victory_core::fastboot::active() {
+        return;
+    }
+    let frame = victory_core::fastboot::frame();
+    let key = |scan: u16, vk: u8| KeyState {
+        scan_code: scan.into(),
+        code_point: u32::from(vk),
+        virtual_key: vk,
+        dead_key: false,
+    };
+    if frame % 2 == 0 {
+        keys.push(key(0x1C, 0x0D));
+    } else if frame % 8 == 1 {
+        keys.push(key(0x01, 0x1B));
+    }
+}
+
+/// VICTORY_AUTO_INPUT: inject A-button presses every ~2 s for the first
+/// 120 s, so menus advance without manual interaction.
+fn auto_input_inject(keys: &mut Vec<KeyState>) {
+    live_press(keys);
+    if victory_core::fastboot::enabled() {
+        fast_boot_keys(keys);
+        return;
+    }
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static START: OnceLock<Instant> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("VICTORY_AUTO_INPUT").is_some()) {
+        return;
+    }
+    let start = *START.get_or_init(Instant::now);
+    let elapsed = start.elapsed();
+    if elapsed > Duration::from_secs(120) {
+        return;
+    }
+    let cycle = elapsed.as_millis() % 2000;
+    if cycle < 100 {
+        keys.push(KeyState {
+            scan_code: 0x1C,
+            code_point: 0x0D,
+            virtual_key: 0x0D,
+            dead_key: false,
+        });
     }
 }
 

@@ -6,6 +6,7 @@
 mod census;
 mod inspect;
 mod run;
+mod saves;
 mod shader;
 mod translate;
 
@@ -13,6 +14,22 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+
+// Agility SDK opt-in: Windows 10 loads D3D12Core.dll 1.614 from .\D3D12\
+// next to the executable (the inbox runtime refuses HEAP_DIRECTLY_INDEXED).
+#[repr(transparent)]
+pub struct SdkPath(*const u8);
+unsafe impl Sync for SdkPath {}
+
+#[used]
+#[unsafe(no_mangle)]
+#[allow(non_upper_case_globals)]
+pub static D3D12SDKVersion: u32 = 614;
+
+#[used]
+#[unsafe(no_mangle)]
+#[allow(non_upper_case_globals)]
+pub static D3D12SDKPath: SdkPath = SdkPath(c".\\D3D12\\".as_ptr().cast());
 
 #[derive(Parser)]
 #[command(
@@ -107,6 +124,14 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
+    /// Manage save slots (`VICTORY_SAVE_SLOT=<name>` picks one when running).
+    Saves {
+        /// Title id (8 hex digits); default: every title with data.
+        #[arg(long)]
+        title: Option<String>,
+        #[command(subcommand)]
+        action: saves::Saves,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -122,7 +147,8 @@ enum Console {
 }
 
 fn main() -> Result<()> {
-    victory_core::logging::init("info");
+    victory_core::env::alias_scarlett();
+    victory_core::logging::init("warn");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
@@ -172,6 +198,7 @@ fn main() -> Result<()> {
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),
+        Command::Saves { title, action } => saves::run(action, title),
     }
 }
 

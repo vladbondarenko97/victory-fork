@@ -335,6 +335,46 @@ fn translate(
         return;
     }
     let example = || format!("{}{} #{hash}", path.display(), source.label());
+    // `VICTORY_TRANSLATE_STUB`: the exposure stand-in
+    // (`VICTORY_EXPOSURE_STUB`) of the containers it may replace, translated
+    // and validated, on stderr.
+    if std::env::var_os("VICTORY_TRANSLATE_STUB").is_some()
+        && emit::exposure::HASHES.contains(&hash.as_str())
+    {
+        let outcome = match emit::exposure::stub(&bytes, emit::exposure::VALUE) {
+            Ok(mut s) => match checks.validator.as_mut() {
+                Some(v) => match v.validate(&mut s.dxil) {
+                    Ok(()) => "translated, validated".to_owned(),
+                    Err(e) => format!("translated, validator: {e}"),
+                },
+                None => "translated".to_owned(),
+            },
+            Err(e) => format!("does not translate: {e}"),
+        };
+        eprintln!("exposure stand-in #{hash}: {outcome}");
+    }
+    if std::env::var_os("VICTORY_TRANSLATE_STUB").is_some() {
+        use emit::stand_in as s;
+        for (kind, hashes, value) in [
+            ("ambient", s::AMBIENT_HASHES, s::AMBIENT_VALUE),
+            ("shadow-mask", s::SHADOWMASK_HASHES, s::SHADOWMASK_VALUE),
+        ] {
+            if !hashes.contains(&hash.as_str()) {
+                continue;
+            }
+            let outcome = match s::storing(&bytes, value) {
+                Ok(mut sh) => match checks.validator.as_mut() {
+                    Some(v) => match v.validate(&mut sh.dxil) {
+                        Ok(()) => "translated, validated".to_owned(),
+                        Err(e) => format!("translated, validator: {e}"),
+                    },
+                    None => "translated".to_owned(),
+                },
+                Err(e) => format!("does not translate: {e}"),
+            };
+            eprintln!("{kind} stand-in #{hash}: {outcome}");
+        }
+    }
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
@@ -380,7 +420,7 @@ fn translate(
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
-    translate_programs(&container, programs, &example, t, checks);
+    translate_programs(&container, &hash, programs, &example, t, checks);
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
@@ -393,7 +433,7 @@ fn translate(
     }
 }
 
-fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
+fn translate_programs(container: &Container, hash: &str, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
     for p in programs {
         t.programs += 1;
         match victory_shader::spill::build(&p) {
@@ -457,7 +497,8 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(container, &p, &program, &s, &i, &r) {
+                    // (by its hash, as at run time: the per-program switches, `VICTORY_WAVE_WHY`)
+                    match emit::for_program(hash, || emit::emit(container, &p, &program, &s, &i, &r)) {
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;

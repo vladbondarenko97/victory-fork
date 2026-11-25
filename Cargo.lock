@@ -693,6 +693,7 @@ dependencies = [
  "miniz_oxide",
  "tempfile",
  "tracing",
+ "victory-core",
  "victory-formats",
  "victory-pipeline",
  "victory-shader",
@@ -708,6 +709,7 @@ dependencies = [
  "opus-pure",
  "tempfile",
  "tracing",
+ "victory-core",
  "victory-formats",
  "victory-gpu",
  "victory-loader",
@@ -754,6 +756,7 @@ dependencies = [
 name = "victory-shader"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "miniz_oxide",
  "thiserror",
  "windows",

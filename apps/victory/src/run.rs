@@ -54,10 +54,14 @@ pub fn run(
     let manifest =
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
     let title = victory_hle::runtime::Title::from_manifest(&manifest);
-    let storage = cfg.data_subdir(&format!("{:08X}/storage", title.id))?;
+    let slot = victory_core::saves::slot_from_env()?;
+    let title_root = cfg.data_subdir(&format!("{:08X}", title.id))?;
+    let paths = victory_core::saves::resolve(&title_root, &slot)?;
+    let storage = paths.storage;
     println!(
-        "title          {:08X}, storage {} ({} MB)",
+        "title          {:08X}, save slot {slot}{}, storage {} ({} MB)",
         title.id,
+        if paths.legacy { " (pre-slot location)" } else { "" },
         storage.display(),
         title.storage_bytes >> 20
     );

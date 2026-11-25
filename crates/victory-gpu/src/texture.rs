@@ -56,6 +56,9 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// Highest late-submission number (`crate::host::STARTED`) that may
+    /// still be reading this staging buffer on the GPU (`0` if none).
+    in_flight: std::sync::atomic::AtomicU64,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -422,19 +425,22 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_MS: u64 = 10_000;
     const IDLE_FRAMES: u64 = 4;
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
     };
+    if map.is_empty() {
+        return;
+    }
+    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
     let (mut went, mut bytes) = (0u64, 0u64);
     map.retain(|_, s| {
         let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), IDLE_MS, IDLE_FRAMES);
+            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
         if !keep {
             LET_GO[0].fetch_add(1, Relaxed);
             LET_GO[1].fetch_add(s.bytes, Relaxed);
@@ -597,6 +603,19 @@ impl Staging {
         (self.memory as usize, self.layout.size as usize)
     }
 
+    /// Notes that late submission `submission` may still be reading this
+    /// staging buffer on the GPU.
+    pub(crate) fn mark_in_flight(&self, submission: u64) {
+        self.in_flight
+            .fetch_max(submission, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The highest late submission number that may still be reading this
+    /// staging buffer on the GPU (`0` if none).
+    pub(crate) fn in_flight(&self) -> u64 {
+        self.in_flight.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
@@ -668,12 +687,12 @@ impl Staging {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+            let Some(mapped) = crate::watch::title_memory_reading_now(start, size) else {
                 return self.refresh_unlocked(last, size);
             };
             mapped
         } else {
-            waited(2, crate::watch::title_memory_reading)
+            waited(2, || crate::watch::title_memory_reading(start, size))
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
@@ -790,14 +809,71 @@ impl Staging {
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
+            if let Err(e) = detile_wide(&self.layout, tiled, mip, slice, linear, pitch, rows) {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
             }
         }
+    }
+}
+
+/// A subresource of at least this many bytes is detiled in bands on the
+/// kept threads ([`crate::shadow::wide_run`]): one thread detiles some
+/// 4.5 GB/s, and a 33-67 MB texture went 1.7-2 times as fast on four
+/// (`victory-formats`' `detile_threads` benchmark).
+const BAND_BYTES: usize = 4 << 20;
+
+/// [`Layout::detile`](victory_formats::texture::Layout::detile) of one
+/// subresource into `linear` (`rows` rows `pitch` bytes apart, depth slices
+/// `pitch * rows` apart); a big one of one slice deep is cut into bands of
+/// rows detiled on several threads.
+fn detile_wide(
+    layout: &victory_formats::texture::Layout,
+    tiled: &[u8],
+    mip: u32,
+    slice: u32,
+    linear: &mut [u8],
+    pitch: usize,
+    rows: u32,
+) -> Result<(), victory_formats::texture::Error> {
+    let height = layout.mips.get(mip as usize).map_or(0, |m| m.height);
+    let deep = layout.subresource_depth(mip) != 1;
+    if deep || linear.len() < 2 * BAND_BYTES || pitch == 0 || height < 2 || height > rows {
+        return layout.detile(tiled, mip, slice, linear, pitch, pitch * rows as usize);
+    }
+    let band = (BAND_BYTES / pitch).clamp(1, height as usize) as u32;
+    let failed = std::sync::Arc::new(Mutex::new(None));
+    let (tiled_at, tiled_len) = (tiled.as_ptr() as usize, tiled.len());
+    let layout_at = std::ptr::from_ref(layout) as usize;
+    let jobs: Vec<Box<dyn FnOnce() + Send>> = linear[..height as usize * pitch]
+        .chunks_mut(band as usize * pitch)
+        .enumerate()
+        .map(|(k, part)| {
+            let y = k as u32 * band;
+            let rows = y..(y + band).min(height);
+            let (part_at, part_len) = (part.as_mut_ptr() as usize, part.len());
+            let failed = failed.clone();
+            Box::new(move || {
+                // SAFETY: `wide_run` returns only when every job has run,
+                // while the caller's borrows of the layout and both buffers
+                // last; the bands are disjoint parts of `linear`.
+                let (layout, tiled, part) = unsafe {
+                    (
+                        &*(layout_at as *const victory_formats::texture::Layout),
+                        std::slice::from_raw_parts(tiled_at as *const u8, tiled_len),
+                        std::slice::from_raw_parts_mut(part_at as *mut u8, part_len),
+                    )
+                };
+                if let Err(e) = layout.detile_rows(tiled, mip, slice, part, pitch, rows) {
+                    *failed.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+                }
+            }) as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    crate::shadow::wide_run(jobs);
+    match failed.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
@@ -937,6 +1013,10 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         return 0;
     }
     if !by_query() {
+        use windows_sys::Win32::System::ProcessStatus::{
+            K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
             // By page, without the walk: whole pages, cut to the range.
@@ -952,14 +1032,40 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // textures "uploaded in part" kept the pass over the heap's views at
         // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
         const BLOCK: usize = 64 << 10;
+        const KERNEL_PAGE: usize = 4096;
+        let last_byte = start.saturating_add(len - 1);
+        let (first, last) = (start / BLOCK, last_byte / BLOCK);
+        // SAFETY: plain data.
+        let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
         let mut there = 0u64;
-        let mut block = start & !(BLOCK - 1);
-        while block < end {
-            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
-                there += (hi - lo) as u64;
+        let mut block = first;
+        while block <= last {
+            let n = (last - block + 1).min(info.len());
+            for (i, entry) in info[..n].iter_mut().enumerate() {
+                let lo = ((block + i) * BLOCK).max(start);
+                entry.VirtualAddress = (lo & !(KERNEL_PAGE - 1)) as *mut _;
             }
-            block = block.saturating_add(BLOCK);
+            // SAFETY: `n` entries of the size given; our own process.
+            let asked = unsafe {
+                K32QueryWorkingSetEx(
+                    GetCurrentProcess(),
+                    info.as_mut_ptr().cast(),
+                    (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+                )
+            } != 0;
+            for (i, entry) in info[..n].iter().enumerate() {
+                let base = (block + i) * BLOCK;
+                let lo = base.max(start);
+                let hi = base.saturating_add(BLOCK).min(end);
+                let probe = (lo & !(KERNEL_PAGE - 1)) as *const u8;
+                // SAFETY: plain data the query filled in.
+                let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
+                let mut byte = [0u8];
+                if valid || crate::host::read_into(probe, &mut byte) {
+                    there += (hi - lo) as u64;
+                }
+            }
+            block += n;
         }
         return there;
     }
@@ -1050,6 +1156,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        in_flight: std::sync::atomic::AtomicU64::new(0),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
@@ -1091,6 +1198,39 @@ mod title_memory_tests {
                 assert!(bytes[0x5_0000..HEAD].iter().all(|&b| b == 0x5a));
                 assert!(bytes[HEAD..].iter().all(|&b| b == 0));
             });
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn mapped_bytes_counts_sparse_blocks_across_batches() {
+        use windows_sys::Win32::System::Memory::*;
+        const BLOCK: usize = 64 << 10;
+        const BLOCKS: usize = 270;
+        // SAFETY: our own reservation; committed blocks are freed below.
+        unsafe {
+            let base =
+                VirtualAlloc(std::ptr::null(), BLOCKS * BLOCK, MEM_RESERVE, PAGE_NOACCESS)
+                    .cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(super::mapped_bytes(base, BLOCKS * BLOCK), 0);
+
+            for idx in [0, 130, 265] {
+                let ptr = base.add(idx * BLOCK);
+                assert_eq!(
+                    VirtualAlloc(ptr.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE),
+                    ptr.cast()
+                );
+                if idx == 130 {
+                    ptr.write(1);
+                }
+            }
+            let skip = 123usize;
+            let cut = 500usize;
+            assert_eq!(
+                super::mapped_bytes(base.add(skip), BLOCKS * BLOCK - skip - cut),
+                (3 * BLOCK - skip) as u64
+            );
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
     }
@@ -1162,6 +1302,110 @@ mod title_memory_tests {
                     .expect("the staging buffer's bytes are enough");
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod detile_tests {
+    use super::{BAND_BYTES, detile_wide};
+    use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+
+    /// Big subresources detiled in bands on several threads, and small ones
+    /// whole, give the rows of one whole detile, also with padded rows and
+    /// in the mips of a big texture.
+    #[test]
+    fn a_texture_detiled_in_bands_is_the_one_detiled_whole() {
+        let desc = |w, h, mips, bpe, block, swizzle| Desc {
+            dimension: Dimension::Tex2d,
+            width: w,
+            height: h,
+            depth: 1,
+            mips,
+            element_bytes: bpe,
+            block,
+            samples: 1,
+            swizzle,
+        };
+        for d in [
+            desc(2048, 1500, 3, 4, 1, Swizzle::SW_64KB_S),
+            desc(4096, 4096, 2, 16, 4, Swizzle::SW_64KB_D),
+            desc(1030, 2051, 1, 8, 1, Swizzle::SW_4KB_S),
+            desc(256, 256, 1, 4, 1, Swizzle::SW_4KB_S),
+        ] {
+            let l = Layout::new(&d).unwrap();
+            let tiled: Vec<u8> = (0..l.size as usize)
+                .map(|i| (i * 7 + i / 4093) as u8)
+                .collect();
+            for mip in 0..d.mips {
+                let m = &l.mips[mip as usize];
+                let pitch = (m.width as usize * d.element_bytes as usize).next_multiple_of(256);
+                let rows = m.height;
+                let size = pitch * rows as usize;
+                let mut whole = vec![0u8; size];
+                l.detile(&tiled, mip, 0, &mut whole, pitch, size).unwrap();
+                let mut banded = vec![0xA5u8; size];
+                detile_wide(&l, &tiled, mip, 0, &mut banded, pitch, rows).unwrap();
+                // Row padding is not written by either: compare the rows.
+                let bytes = m.width as usize * d.element_bytes as usize;
+                for y in 0..rows as usize {
+                    assert_eq!(
+                        banded[y * pitch..][..bytes],
+                        whole[y * pitch..][..bytes],
+                        "{d:?} mip {mip} row {y} ({} bands)",
+                        size.div_ceil(BAND_BYTES)
+                    );
+                }
+            }
+        }
+    }
+
+    /// The detile of a submission's big texture whole on one thread and in
+    /// bands on the kept threads (a benchmark: `cargo test --release -p
+    /// victory-gpu detile_in_bands -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "benchmark"]
+    fn detile_in_bands() {
+        for (w, h, bpe, swizzle) in [
+            (3840u32, 2160u32, 4u32, Swizzle::SW_4KB_S),
+            (4096, 4096, 4, Swizzle::SW_64KB_S),
+            (2048, 2048, 16, Swizzle::SW_64KB_D),
+            (1024, 1024, 4, Swizzle::SW_64KB_S),
+        ] {
+            let d = Desc {
+                dimension: Dimension::Tex2d,
+                width: w,
+                height: h,
+                depth: 1,
+                mips: 1,
+                element_bytes: bpe,
+                block: 1,
+                samples: 1,
+                swizzle,
+            };
+            let l = Layout::new(&d).unwrap();
+            let tiled: Vec<u8> = (0..l.size as usize).map(|i| i as u8).collect();
+            let pitch = (w * bpe) as usize;
+            let size = pitch * h as usize;
+            let mut linear = vec![0u8; size];
+            let mut fastest = |f: &mut dyn FnMut(&mut [u8])| {
+                (0..7)
+                    .map(|_| {
+                        let started = std::time::Instant::now();
+                        f(&mut linear);
+                        started.elapsed().as_secs_f64()
+                    })
+                    .fold(f64::INFINITY, f64::min)
+            };
+            let one = fastest(&mut |out| l.detile(&tiled, 0, 0, out, pitch, size).unwrap());
+            let bands = fastest(&mut |out| detile_wide(&l, &tiled, 0, 0, out, pitch, h).unwrap());
+            println!(
+                "{w}x{h} {bpe} B {swizzle:?}, {:.1} MB: whole {:.2} ms, in bands {:.2} ms ({:.2}x)",
+                size as f64 / 1e6,
+                one * 1e3,
+                bands * 1e3,
+                one / bands
+            );
         }
     }
 }

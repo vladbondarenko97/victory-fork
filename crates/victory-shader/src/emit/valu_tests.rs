@@ -1264,3 +1264,193 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// A one-thread program that stores 7 through the raw UAV whose descriptor
+/// it loads at heap index `s0` from the address in `s4`, which is the
+/// resource heap itself (`ResourceHeap`: bindless, no used-resource entry)
+/// or a table; lowered with the view heap limit and heap map `heap` gives
+/// this thread (`TEST_VIEW_HEAP`).
+fn lower_store_cs(root: RootType, heap: (u32, Option<(u32, u32)>)) -> HostShader {
+    let words = [
+        s_mov_b32(5, 0x80),     // s5 = 0
+        sop2(0x1E, 6, 0, 0x85), // s_lshl_b32 s6, s0, 5: the index from data
+        // s_load_dwordx4 s[8:11], s[4:5], s6
+        s_load_dwordx4(8, 4)[0],
+        6 << 25,
+        vop1(0x001, 0, 0x87), // v_mov_b32 v0, 7
+        buffer_store_dword(0, 8, 0)[0],
+        buffer_store_dword(0, 8, 0)[1],
+        S_ENDPGM,
+    ];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: if root == RootType::Table {
+            vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }]
+        } else {
+            Vec::new()
+        },
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    super::shader::TEST_VIEW_HEAP.set(Some(heap));
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    });
+    super::shader::TEST_VIEW_HEAP.set(None);
+    let lowered = lowered.expect("lower");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    shader
+}
+
+/// Under a heap map, a view taken from the resource heap itself is looked
+/// up (the translation changes with the window and the map's slot, which
+/// the shader cache key holds), and nothing else changes: no user data,
+/// root views or root parameters of its own, so the host's root signatures
+/// stay as they were. A table's index is the host's already: a table is
+/// translated the same with and without a map.
+#[test]
+fn only_views_from_the_resource_heap_are_looked_up_in_the_heap_map() {
+    const LIMIT: u32 = 999_999;
+    let bindless = |map| lower_store_cs(RootType::ResourceHeap, (LIMIT, map));
+    let plain = bindless(None);
+    assert_eq!(plain.dxil, bindless(None).dxil, "translations are repeatable");
+    let mapped = bindless(Some((131_072, 737_854)));
+    assert_ne!(plain.dxil, mapped.dxil, "a bindless view is looked up");
+    assert_ne!(mapped.dxil, bindless(Some((131_072, 737_853))).dxil);
+    assert_ne!(mapped.dxil, bindless(Some((65_536, 737_854))).dxil);
+    assert_eq!(plain.user_data, mapped.user_data);
+    assert_eq!(
+        (&plain.root_cbvs, &plain.root_srvs, &plain.root_uavs),
+        (&mapped.root_cbvs, &mapped.root_srvs, &mapped.root_uavs)
+    );
+    let table = |map| lower_store_cs(RootType::Table, (LIMIT, map));
+    assert_eq!(table(None).dxil, table(Some((131_072, 737_854))).dxil);
+}
+
+/// On the hardware GPU and WARP, a bindless store at a title index below
+/// the window lands at that index, one at a title index the heap map maps
+/// lands at the host slot it names, and one the map leaves at 0 (never
+/// written, or past the map's end) lands at the null slot the limit names
+/// (here a raw UAV of its own, to see the stores it takes).
+#[test]
+fn a_heap_index_past_the_window_reads_the_slot_the_heap_map_gives() {
+    // Heap: UAVs at 0 and 1, the map at 2, the limit's slot at 3. Window
+    // 1: title index 0 is host slot 0; the map's entries are for title
+    // indices 1, 2, 3: none, host slot 1, none.
+    let shader = lower_store_cs(RootType::ResourceHeap, (3, Some((1, 2))));
+    let map = [0, !1u32, 0];
+    let cases: [(u32, [u32; 3]); 7] = [
+        (0, [7, 0, 0]),           // below the window
+        (2, [0, 7, 0]),           // mapped to host slot 1
+        (1, [0, 0, 7]),           // an entry of 0: the limit's slot
+        (3, [0, 0, 7]),           // likewise
+        (4, [0, 0, 7]),           // past the map's end
+        (1 << 25, [0, 0, 7]),     // far past it
+        (0x07FF_FFFF, [0, 0, 7]), // the last index an address gives
+    ];
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for (title, want) in cases {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.dword) {
+                    (RootType::Constants, 0) => title,
+                    (RootType::Constants, _) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[
+                            View::RawUav(1),
+                            View::RawUav(1),
+                            View::Buffer {
+                                data: &map,
+                                stride: super::host::Stride::Raw,
+                            },
+                            View::RawUav(1),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            let got = [out[0][0], out[1][0], out[2][0]];
+            assert_eq!(got, want, "{label}: title index {title:#x}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}

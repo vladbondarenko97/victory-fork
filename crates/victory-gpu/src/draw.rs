@@ -503,6 +503,7 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        victory_core::fastboot::note_render_targets();
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -961,6 +962,23 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_WORDS {
+                        // Ours: the console descriptor dwords by view heap
+                        // slot, for descriptors read as numbers.
+                        match self.heap_words(list) {
+                            // SAFETY: an open list; the table lives as long
+                            // as the heap the list holds.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => once!("a shader reads descriptor dwords from a view heap that is not set"),
+                        }
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
@@ -1267,6 +1285,26 @@ impl State {
     /// writes through a picked unordered access view stays in the host
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
+    /// The GPU address of the bound view heap's table of console
+    /// descriptor dwords (`victory_shader::emit::SLOT_WORDS`), which `list`
+    /// then holds.
+    fn heap_words(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let (gpu, buffer) = host.words_table()?;
+        // One key per list, as for the table of strides.
+        const ONCE: usize = usize::MAX - 0x5f;
+        if list.first_use(ONCE) {
+            list.keep(buffer);
+        }
+        Some(gpu)
+    }
+
     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
         let heap = self
             .heaps
@@ -1445,8 +1483,8 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
-        /// Bytes of texture memory staged per frame.
-        const PER_FRAME: u64 = 192 << 20;
+        let memory = crate::host::host().and_then(|h| h.video_memory());
+        let per_frame = staging_budget_per_frame(memory.map(|[budget, ..]| budget));
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
@@ -1460,7 +1498,7 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
-        let room = crate::resource::room();
+        let room = crate::resource::room(memory);
         if !room {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
             once!("textures picked by index: the card has no room for more; they wait");
@@ -1502,7 +1540,7 @@ impl State {
         const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
         let began = std::time::Instant::now();
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > SPAN {
+            if SPENT.load(Ordering::Relaxed) >= per_frame || began.elapsed() > SPAN {
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
@@ -2196,7 +2234,7 @@ impl State {
                 // The vertices are read in place, at submission: no change
                 // of mapping under the read (see
                 // `crate::watch::title_memory_reading`).
-                let _mapped = crate::watch::title_memory_reading();
+                let _mapped = crate::watch::title_memory_reading(from, n * 3 * stride);
                 // SAFETY: the vertices lie in a title buffer (checked when
                 // recorded) and the scratch memory is the list's.
                 let (src, dst) = unsafe {
@@ -2689,4 +2727,97 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+/// Per-frame texture staging byte budget scaled from the adapter's local VRAM
+/// budget (`None` keeps the 192 MiB 12 GiB baseline).
+fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
+    const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
+    match vram_budget {
+        Some(budget) if budget <= 6 * GIB => 96 * MIB,
+        Some(budget) if budget >= 20 * GIB => 384 * MIB,
+        Some(budget) if budget > 12 * GIB => 256 * MIB,
+        _ => 192 * MIB,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staging_budget_scales_with_vram_budget() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        assert_eq!(staging_budget_per_frame(None), 192 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(4 * GIB)), 96 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(6 * GIB)), 96 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(8 * GIB)), 192 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(12 * GIB)), 192 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(13 * GIB)), 256 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(14 * GIB)), 256 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(16 * GIB)), 256 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(20 * GIB)), 384 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(24 * GIB)), 384 * MIB);
+        assert_eq!(staging_budget_per_frame(Some(32 * GIB)), 384 * MIB);
+    }
+
+    /// With a heap map, a table whose entries lie below the identity window
+    /// is read in place, and one whose entries reach past it (its title
+    /// slots have no host slot at their own index) is made afresh in
+    /// dynamic slots, which follow the map's slot.
+    #[test]
+    fn tables_past_the_heap_maps_window_are_made_afresh() {
+        use crate::descriptor::host::{DYNAMIC, TEST_MAP};
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        let null: This = std::ptr::null();
+        let mut heap_obj: This = null;
+        let desc = [0u32, 64, 1, 0, 0, 0, 0, 0];
+        let iid = ID3D12DescriptorHeap::IID;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                desc.as_ptr().cast(),
+                std::ptr::from_ref(&iid).cast(),
+                &mut heap_obj,
+            ),
+            crate::object::S_OK
+        );
+        let start = crate::descriptor::heap(heap_obj).start;
+        TEST_MAP.set(Some((16, 24)));
+        let heap = crate::descriptor::heap(heap_obj).host().expect("a host heap");
+        TEST_MAP.set(None);
+        assert_eq!(heap.count(), 16);
+
+        let mut state = State::default();
+        state.set_heaps(&[heap_obj]);
+        // Entry 1 of the table: one descriptor past its start.
+        let used = [UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 8,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }];
+        // A table at 2: entry 1 is title slot 3, in the window.
+        state.set_table(false, 0, start + 2 * 32);
+        assert!(state.tables(&list, &used, &[], false).is_empty(), "read in place");
+        // A table at 15: entry 1 is title slot 16, past it.
+        state.set_table(false, 0, start + 15 * 32);
+        let made = state.tables(&list, &used, &[], false);
+        assert_eq!(made.len(), 1, "made afresh");
+        let first = made[0].1 / 32;
+        assert!((25..25 + DYNAMIC).contains(&first), "{first}: a dynamic slot");
+        list.close();
+        drop(state);
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(heap_obj, 0x10);
+        assert_eq!(release(heap_obj), 0);
+    }
 }

@@ -26,6 +26,27 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// Where the [`SLOT_STRIDES`] buffer goes on, in dwords: two per heap slot,
+/// the low and then the high dword of the title address of the buffer view
+/// at that slot (0: none). For a program that takes a buffer view out of the
+/// heap at an index it computes and reads the address out of the descriptor
+/// to walk the memory behind it (the shadow-ray trace programs take their
+/// ray-tracing structure this way).
+pub const SLOT_ADDRESSES: u32 = SLOT_STRIDES_COUNT;
+/// Dwords of the whole [`SLOT_STRIDES`] buffer: the strides, then the
+/// addresses ([`SLOT_ADDRESSES`]).
+pub const SLOT_STRIDES_DWORDS: u32 = 3 * SLOT_STRIDES_COUNT;
+
+/// The root SRV `t<SLOT_WORDS>` in [`ROOT_CBV_SPACE`] of a shader that
+/// reads a view-heap descriptor's dwords as numbers (sizes, levels, the
+/// image type, a buffer's stride or record count) instead of using it as a
+/// resource, or reads dwords of a used one the host view has no value for:
+/// a raw buffer of [`SLOT_STRIDES_COUNT`] slots of
+/// [`super::words::WORDS`] dwords the host keeps, slot `i` the GFX10
+/// descriptor of the view at heap slot `i` ([`super::words`]; zeros where
+/// there is none), so a descriptor dword's heap address is its byte offset
+/// there.
+pub const SLOT_WORDS: u8 = 252;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -122,6 +143,51 @@ static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::
 /// See [`VIEW_LIMIT`]: `null_slot` is the last slot of the host's view heap, kept null.
 pub fn set_view_heap_limit(null_slot: u32) {
     VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The [`VIEW_LIMIT`] shaders are translated with now (0: none).
+pub fn view_heap_limit() -> u32 {
+    #[cfg(test)]
+    if let Some((limit, _)) = TEST_VIEW_HEAP.get() {
+        return limit;
+    }
+    VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The heap map of a host view heap capped below the title's slots (see
+/// `Lower::heap_remap`), packed: its identity window in the high 32 bits,
+/// the view heap slot of the map (a raw buffer) in the low ones; `u64::MAX`:
+/// none. Set with [`VIEW_LIMIT`], before the first shader is translated: a
+/// shader keeps the map it was translated with, and the host lays its view
+/// heap out by the same values.
+static VIEW_MAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// See [`VIEW_MAP`]: `Some((window, slot))` makes shaders translated from
+/// now on look a view they take from the resource heap itself up in the
+/// heap map at view heap slot `slot` when its index is `window` or more;
+/// `None` reads every index in place.
+pub fn set_view_heap_map(map: Option<(u32, u32)>) {
+    let packed = map.map_or(u64::MAX, |(window, slot)| u64::from(window) << 32 | u64::from(slot));
+    VIEW_MAP.store(packed, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The heap map shaders are translated with now ([`set_view_heap_map`]).
+pub fn view_heap_map() -> Option<(u32, u32)> {
+    #[cfg(test)]
+    if let Some((_, map)) = TEST_VIEW_HEAP.get() {
+        return map;
+    }
+    let packed = VIEW_MAP.load(std::sync::atomic::Ordering::Relaxed);
+    (packed != u64::MAX).then_some(((packed >> 32) as u32, packed as u32))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the view heap limit and heap map shaders this thread
+    /// translates are made with, in place of [`VIEW_LIMIT`] and
+    /// [`VIEW_MAP`], without reaching other tests' translations.
+    pub(crate) static TEST_VIEW_HEAP: std::cell::Cell<Option<(u32, Option<(u32, u32)>)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 pub(crate) struct Shader {
@@ -397,7 +463,7 @@ impl Shader {
         props: (u32, u32),
     ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
-        let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        let limit = view_heap_limit();
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);
